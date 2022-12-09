@@ -8,6 +8,6 @@ repo accompanying Glasner, Rose, Sharma, et al manuscript
 	- Run BayesPrism with downsample - run_BP_indiv_downsampled.R
 	- Assess factor use in tissue - factor_usage_visium.Rmd (html)
 	- Define signaling niches - IFN_IC_niche_definition.Rmd
-	- Tumor state analysis - tumorState_analysis.Rmd (html)
+	- Tumor state analysis - tumorState_analysis.Rmd
 	- QC of deconvolution - deconv_indiv_qc.Rmd (html)
 	- Functions used through the course of visium analysis - Visium_helper_functions.R
