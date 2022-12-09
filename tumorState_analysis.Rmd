@@ -1,0 +1,872 @@
+---
+title: "tumorState_analysis"
+output: 
+  html_document:
+    df_output: paged
+    toc: TRUE
+    theme: 'simplex'
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = 'hide')
+```
+
+```{r}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(ggthemes)
+  library(patchwork)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(gridExtra) 
+  library(ggdendro)
+  library(readr)
+  library(data.table)
+  library(DT)
+  library(fgsea)
+  library(SpaceFold)
+  library(mclust)
+})
+
+# load visium helper functions
+source("/data/peer/sam/treg_dep/scripts/visium/visium_helper_functions.R")
+# figure directory
+fig_dir = "/data/peer/sam/treg_dep/visium/results/tumor_subcluster"
+
+# read in cell type name conversion
+name_conv_df = read.csv( "/data/peer/sam/treg_dep/visium/bayesprism/viter1_nameConvSheet.csv", h = T, stringsAsFactors = F)
+
+
+```
+
+```{r}
+
+#  resize image so the plots aren't so big with the image
+# background
+.resize_slice_images <- function(obj, w = 300) {
+  if (!requireNamespace("EBImage", quietly = TRUE)) return(obj)
+  .resize_image <- function(k) {
+    new_k <- paste0(k, "_scaled")
+    obj@images[[new_k]] <- obj@images[[k]]
+    obj@images[[new_k]]@image <- EBImage::resize( obj@images[[k]]@image, w = w)
+    r <- w / nrow(obj@images[[k]]@image)
+    obj@images[[k]] <- NULL
+    obj@images[[new_k]]@scale.factors$lowres <- obj@images[[new_k]]@scale.factors$lowres * r
+    obj
+  }
+  all_images <- Images(obj)
+  for(i in all_images) {
+    obj <- .resize_image(i)
+  }    
+  obj
+}
+
+```
+
+
+```{r}
+# read in the visium data, now a processed RDS file
+#d.m = readRDS( '/data/peer/sam/treg_dep/visium/data/requant/processed/treg_dep_visium_merged_quant2_20220829.rds')
+
+# for each quantification round, read in the cellltype fractions, thetaCV, selected spot matrix
+deconv_base_folder = '/data/peer/sam/treg_dep/visium/bayesprism'
+deconv_folders = c('deconv_viter1', 'deconv_viter1merged')#, 
+#'deconv_r4', 
+# 'deconv_r5')
+
+# read in cell fraction files and collapse to a single data frame
+ct_frac = lapply(deconv_folders, function(folder){
+  ct_frac_files = list.files(file.path(deconv_base_folder, folder), pattern = "*_theta.csv", full.names = T)
+  ct.l = lapply(ct_frac_files, read.csv, row.names = 1)
+  #names(ct.l) = gsub("_theta.csv", "", ct_frac_files)
+  ct.lm = do.call(rbind,ct.l)
+  colnames(ct.lm) = make.names(colnames(ct.lm))
+  return(ct.lm)
+})
+names(ct_frac) = deconv_folders
+
+# read in CV of cell fraction estimate
+ct_cv = lapply(deconv_folders, function(folder){
+  ct_frac_files = list.files(file.path(deconv_base_folder, folder), pattern = "*_thetaCV.csv", full.names = T)
+  ct.l = lapply(ct_frac_files, read.csv, row.names = 1)
+  #names(ct.l) = gsub("_thetaCV.csv", "", ct_frac_files)
+  ct.lm = do.call(rbind,ct.l)
+  colnames(ct.lm) = make.names(colnames(ct.lm))
+  return(ct.lm)
+})
+names(ct_cv) = deconv_folders
+
+# read in selected spot matrix
+ssm = lapply(deconv_folders, function(folder){
+  ssm.l = readRDS(file.path(deconv_base_folder, folder, 'sf_selected_spot_matrix.rds'))
+  ssm.m = do.call(rbind, ssm.l)
+  colnames(ssm.m) = make.names(colnames(ssm.m))
+  return(ssm.m)
+})
+names(ssm) = deconv_folders
+
+ssm.m = read.csv(file.path('/data/peer/sam/treg_dep/visium/bayesprism/deconv_viter1', 'selected_spot_matrix.median.csv' ), 
+               row.names = 1, stringsAsFactors = F)
+
+
+```
+
+
+
+```{r, message = F, results = 'hide'}
+
+## load 10x data and cell fractions
+
+# load data and remove off tissue points
+# this folder will be set to where 10x visium data files are stored
+base_folder = '/data/peer/sam/treg_dep/visium/data/requant/results'
+
+
+# dirs where visium samples are
+data_folders <- base::list.dirs(base_folder, recursive = T)
+data_folders <- data_folders[grepl("outs$", data_folders)]
+#data_folders <- system2("find", c('.', "-name", shQuote("outs$"), "type", "-d", "-print"), stdout = T)
+# read in visium data
+d <- lapply(data_folders, Load10X_Spatial)
+names(d) <- unlist(lapply(strsplit(data_folders, "/"), "[[", 10)) %>% gsub("_IGO_11440_[0-9]+", "", .)
+
+# add necessary metadata to the tissue sections
+lapply(names(d), function(x){
+  d[[x]]@meta.data <<- mutate(d[[x]]@meta.data, section = x, 
+                              treatment = ifelse(grepl("Ctrl", x), 'Ctrl', 'DT'))
+})
+
+# first split the cellfractions into the different tissue sections
+
+split.idx = remove_barcode(rownames(ct_frac$deconv_viter1))
+ct_frac.nm.l = split(ct_frac$deconv_viter1, factor(split.idx))
+ct_frac.merge.l = split(ct_frac$deconv_viter1merged, factor(split.idx))
+
+# update the cell names to reflect what the bp output has
+d = lapply(d, function(x){
+  #print(head(paste(x@meta.data[,'section'], colnames(x), sep = "_")))
+  x = RenameCells(x, add.cell.id = x@meta.data[,'section'])
+  x
+})
+
+# filter the 10x objects that I have for only spots that are in deconvolution
+d = lapply(names(d), function(x){
+  subset(d[[x]], cells = rownames(ct_frac.nm.l[[x]]))
+})
+names(d) = names(ct_frac.nm.l)
+
+# # add cell type fractions to each section
+lapply(names(d), function(x){
+  ct_obj = CreateAssayObject(counts = ct_frac.nm.l[[x]] %>% t())
+  d[[x]][['BPnm']] <<- ct_obj
+  ct_obj = CreateAssayObject(counts = ct_frac.merge.l[[x]] %>% t())
+  d[[x]][['BPmerge']] <<- ct_obj
+})
+
+
+ssm.nm.l = split(as.data.frame(ssm.m), factor(split.idx))
+ssm.merge.l = split(as.data.frame(ssm$deconv_viter1merged), factor(split.idx))
+
+# # add pos/neg indication to each section
+lapply(names(d), function(x){
+  ct_obj = CreateAssayObject(counts = ssm.nm.l[[x]] %>% t())
+  d[[x]][['SSMnm']] <<- ct_obj
+  ct_obj = CreateAssayObject(counts = ssm.merge.l[[x]] %>% t())
+  d[[x]][['SSMmerge']] <<- ct_obj
+})
+
+```
+
+
+```{r}
+
+# fix size of images for plots
+for(i in names(d)){
+  d[[i]] <- .resize_slice_images(d[[i]], w = 200)
+}
+
+```
+
+# process tumor state fraction data
+
+
+Process tumor state fraction data for clustering.  
+
+```{r}
+# tumor spots defined by the unmerged reference deconvolution
+tumor_spots = rownames(ssm.m)[ssm.m[,'Tumor']]
+# extract epithelial data from first replicate of all tissue sections
+ct_epi = ct_frac$deconv_viter1merged[grepl("_A1_|_C1_", rownames(ct_frac$deconv_viter1merged)),c(#'AT1', 'AT2', 
+'EMT', 'Lung.progenitor.like', 'AT1.like', 'Gastric', 'AT2.like', 'Endoderm.like', 'High.plasticity')]
+# filter for tumors
+ct_epi = ct_epi[rownames(ct_epi) %in% tumor_spots,]
+
+ct_epi.scale = apply(ct_epi, 2, scale)
+
+```
+
+
+Plotting the tumor state fractions with hierarchical clustering. 
+
+```{r}
+
+Heatmap(ct_epi.scale, 
+        clustering_method_columns = 'average', clustering_method_rows = 'average',
+        clustering_distance_columns = 'pearson', clustering_distance_rows = 'pearson',
+        show_row_names = F, )
+
+
+```
+
+## define tumor state clusters
+
+Number of spots in each tumor state cluster. 
+
+```{r}
+
+hc = fastcluster::hclust(as.dist(1 - cor(ct_epi.scale %>% t())), method = 'average')
+hc.cluster = cutree(hc, k = 7)
+table(hc.cluster)
+
+```
+
+
+Tumor state clusters plotted. 
+
+
+```{r}
+
+col_vec = c('#59A14F', '#F28E2B','#4E79A7',  '#A0CBE8', '#F1CE63', '#D4A6C8', '#E15759')
+names(col_vec) = c('Gastric','Endoderm.like', 'AT2.like',  'AT1.like','EMT','Lung.progenitor.like',  'High.plasticity')
+
+col_vec_cid = col_vec[hc.cluster]
+names(col_vec_cid) = hc.cluster
+
+
+ra <- rowAnnotation(`Cell fraction cluster` = names(col_vec_cid[hc$order]),
+    
+                       col = list(`Cell fraction cluster` = col_vec_cid[hc$order]))
+
+tum_order = c('High.plasticity', 'Lung.progenitor.like', 
+                                'EMT', 'AT2.like', 'AT1.like', 
+                                'Endoderm.like', 'Gastric')
+# pdf(file.path(fig_dir, 'tumor_spot_cluster_heatmap.pdf'),
+#     height = 6, width = 8)
+Heatmap(ct_epi.scale[hc$order,c('EMT','High.plasticity', 'Lung.progenitor.like', 
+                                 'AT2.like', 'AT1.like', 
+                                 'Gastric', 'Endoderm.like')],
+        cluster_rows = F,
+        cluster_columns = F,
+        left_annotation = ra, 
+        name = "RNA %\nZ-score"
+        )
+#dev.off()
+
+```
+
+
+## spatial plot of tumor clusters
+
+```{r}
+
+# assign cluster numbers to tumor states
+tum_conv_df = data.frame(cluster_number = 1:7,
+                         tumor_type = c('Gastric','Endoderm.like', 'AT2.like',  'AT1.like','EMT','Lung.progenitor.like',  'High.plasticity')
+                           )
+
+hc.cluster.tum = tum_conv_df$tumor_type[match(hc.cluster, tum_conv_df$cluster_number)]
+names(hc.cluster.tum) = rownames(ct_epi)
+
+# assign to spatial data
+# add this metadata to the image objects to be plotted in the spatial context
+invisible(lapply(names(d), function(x){
+
+  hc_filt = hc.cluster.tum[grepl(x, names(hc.cluster.tum))]
+
+  d[[x]]@meta.data[,'tumor_type'] <<- hc_filt[rownames(d[[x]]@meta.data)]
+
+}))
+
+```
+
+```{r}
+for(i in c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')){
+  Idents(d[[i]]) <- 'tumor_type'
+}
+
+#pdf(file.path(fig_dir, 'tumorState_spatPlot.pdf'))
+lapply(d[c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')], function(x){
+  SpatialDimPlot(subset(x, cells = colnames(x)[colnames(x) %in% tumor_spots]), 
+                 pt.size.factor = 1.2) +
+    scale_fill_manual(values = col_vec, breaks = names(col_vec), na.value = NA, 
+                      name = 'Tumor state')
+}
+)
+#dev.off()
+
+```
+
+
+# define sub-lesional areas
+
+I will use tumor state to define this based on cluster and then do connected components. 
+
+AT1 and AT2 like states will be merged because there is some expected mixing in these states and it will prove very hard to resolve at this resolution if at all. 
+
+
+```{r}
+
+
+# modify so that AT1 and 2 are in the same tumor type
+for(i in c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')){
+  d[[i]]$tumor_type_mod = ifelse(d[[i]]@meta.data$tumor_type %in% c('AT1.like', 'AT2.like'), 'AT1/2.like', d[[i]]@meta.data$tumor_type)
+}
+
+
+
+```
+
+```{r, message = FALSE, error = FALSE, results = FALSE}
+
+# for each tissue section, for each leiden cluster, get the connected components
+d_cc = invisible(lapply(d[c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')], function(x){
+  
+  
+  x_f = x[,!(is.na(x@meta.data$tumor_type))]
+  
+  regions = x_f@meta.data$tumor_type_mod %>% unique()
+  #print(paste("regions =", regions))
+  
+  # for each cell fraction cluster define connected components
+  ## the minimum number of spots in a cluster is 5 for this to run
+  res = unlist(lapply(regions, function(r){
+    x_f_r = x_f[,x_f@meta.data$tumor_type_mod == r]
+    if(ncol(x_f_r) > 6){
+      cc = separate_connected_components(x_f_r)  
+      # remove spots that could not be added to a CC
+      ## gotta fix this part
+      cc = cc[cc != 'NA']
+      cc_ret = paste(r, cc, sep = "_")
+      names(cc_ret) = names(cc)
+      cc_ret
+    }
+    
+  } ), use.names = T
+  )
+  
+  
+
+  
+  # put in the same order as the data frame
+  res_format = left_join(data.frame(barcode = colnames(x)), 
+                         data.frame(barcode = names(res), 
+                                    tumor_lesion = res), 
+                         by = 'barcode')
+  x@meta.data['tumor_lesion'] <- res_format$tumor_lesion
+  return(x)
+}))
+
+
+
+```
+
+```{r, fig.height=12, fig.width=14, message = 'hide', error = FALSE}
+
+invisible(lapply(names(d_cc), function(x){
+  Idents(d_cc[[x]]) <<- 'tumor_lesion'
+}))
+
+sp = lapply(d_cc, function(x){
+  meta.data_f = x@meta.data[!(is.na(x@meta.data$tumor_lesion)),]
+  lesion_bcs = rownames(meta.data_f)
+  lesions_bcs.l = split(lesion_bcs, meta.data_f$tumor_lesion)
+  highlight_colors = colorRampPalette(ggthemes_data$tableau$`color-palettes`$regular$`Classic Cyclic`$value)(65)
+  highlight_colors_f = c(highlight_colors[1:length(lesions_bcs.l)], 'grey')
+  alpha_idx = ifelse(is.na(x@meta.data$tumor_lesion), 0, 1)
+  SpatialDimPlot(x, label = T, cells.highlight = lesions_bcs.l, 
+                 cols.highlight = highlight_colors_f, repel = T, pt.size.factor = 1.2) + 
+    theme(legend.position = 'none')
+})
+
+sp
+
+```
+
+
+## expression of marker genes in lesional areas
+
+```{r}
+
+# get marker gene expression for each of the tumor clusters
+
+# first combine and normlize the visium data from serial section 1
+# create a merged object for different downstream analyses
+d.m = merge(d[[1]], d[2:length(d)])
+
+d.m_rep1 = d.m[,d.m@meta.data$section %in% c('Ctrl1_A1', 'Ctrl2_C1', 'DT1_A1', 'DT2_C1')]
+# get genes to filter out
+gene_sum = rowSums(d.m_rep1@assays$Spatial@counts)
+gene_rm = gene_sum < 10
+print(sum(gene_rm))
+
+# SCTransform normalize all spots in the merged object for first technical replicate and then subset these for the tumor lesion response
+DefaultAssay(d.m_rep1) <- 'Spatial'
+d.m_rep1 = SCTransform(d.m_rep1, assay = "Spatial", verbose = F)
+# fix the images so I don't have all of the ones I don't need
+d.m_rep1@images = d.m_rep1@images[c('slice1', 'slice1.2', 'slice1.4', 'slice1.6')]
+
+
+
+```
+
+
+
+```{r}
+# load necessary data for plotting
+
+
+# read in the cytokine signaling information
+score_dfs = readRDS(file.path("/data/peer/sam/treg_dep/visium/results/factor_usage/", 'ic_ifn_scores_rep1.csv'))
+
+for(i in names(score_dfs)){
+  #d[[i]]@meta.data = cbind(d[[i]]@meta.data, score_dfs[[i]])
+  d_cc[[i]]@meta.data = cbind(d_cc[[i]]@meta.data, score_dfs[[i]])
+}
+
+# read in the niche labels
+niche_labels = read.csv("/data/peer/sam/treg_dep/visium/results/factor_usage/niche_labels_rep1.csv")
+
+
+# process lesion specific data
+ic_df = do.call(rbind, lapply(d_cc, function(x){
+  x@meta.data %>% tibble::rownames_to_column(var = 'barcode') %>%
+    dplyr::filter(!(is.na(tumor_lesion))) %>%
+    dplyr::select(section, tumor_lesion, tumor_type, tumor_type_mod, ic_shared, barcode ) %>%
+    mutate(lesion_id = paste(section, tumor_lesion, sep = ":")) %>%
+    left_join(niche_labels, by = 'barcode')
+}))
+
+
+```
+
+```{r}
+
+# subset and add in metadata
+#d.m_rep1.tum = subset(d.m_rep1, cells = ic_df$barcode)
+d.m_rep1.tum = subset(d.m_rep1, cells = colnames(d.m_rep1)[!(is.na(d.m_rep1@meta.data$tumor_type))])
+
+```
+
+```{r, fig.height = 6, fig.width = 6}
+
+# get expression for marker genes of different states
+exp.m = d.m_rep1.tum@assays$SCT@data[c( 'Hopx', 'Sftpc', 'Fn1', 'Gc', 'Gkn2','Itga2','Sox2'),] %>% as.matrix() %>% reshape2::melt() %>%
+  left_join(ic_df %>% dplyr::select(barcode, tumor_type), 
+            by = c('Var2' = 'barcode'))
+
+col_vec = c('#59A14F', '#F28E2B','#4E79A7',  '#A0CBE8', '#F1CE63', '#D4A6C8', '#E15759')
+names(col_vec) = c('Gastric','Endoderm.like', 'AT2.like',  'AT1.like','EMT','Lung.progenitor.like',  'High.plasticity')
+
+
+# pdf(file.path(fig_dir, 'tumor_spot_marker_gene_violin.pdf'), 
+#     height = 10, 
+#     width = 10)
+ggplot(exp.m, aes(x = tumor_type, y = value)) +
+  geom_violin(aes(fill = tumor_type)) +
+  geom_jitter(alpha = .2, size = .1) +
+  #scale_fill_tableau() +
+  theme_classic() +
+  facet_wrap(~ Var1, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = col_vec, breaks = names(col_vec), na.value = NA, 
+                    name = 'Tumor state') +
+  labs(x = 'Tumor state', y = 'Log normalized expression') +
+  theme(legend.position = 'bottom',
+    axis.text = element_text(size = 12), 
+    axis.title = element_text(size = 16), 
+    strip.text.x = element_text(size = 16))
+
+#dev.off()
+
+```
+
+## Treg depletion response in lesions
+
+Here I will use each individual tumor area that I have defined to see if it is 'responding' to Treg depletion on the basis of its inflammatory cytokine response. This is defined as greater than 10% of spots within the tumor area being part of an IC or IFN niche, or showing some evidence of immune response. 
+
+
+```{r}
+
+
+# compute lesion size and number of ic spots
+ic_df = left_join(ic_df, ic_df %>%
+                    group_by(lesion_id) %>%
+                    summarise(lesion_size = n(), 
+                              #num_ic_spots = sum(niche == 'IC' | niche == 'IFN+IC' )) %>%
+                              num_ic_spots = sum(niche != 'other' )) %>%
+                    ungroup(), 
+                  by = 'lesion_id')
+
+
+ic_df.mean = group_by(ic_df, lesion_id, lesion_size, num_ic_spots, tumor_type_mod) %>%
+  summarise(mean_ic = mean(ic_shared)) %>%
+  ungroup()
+
+ic_df.mean.f = ic_df.mean %>% dplyr::filter(lesion_size > 6 & grepl("DT", lesion_id))
+
+ic_df.mean.f = mutate(ic_df.mean.f, frac_ic_spots = num_ic_spots / lesion_size)
+
+```
+
+How many tumors are there in either conditions after filters?
+
+```{r}
+
+ic_df.mean %>% dplyr::filter(lesion_size > 6 ) %>%
+  mutate(condition = ifelse(grepl("Ctrl", lesion_id), "Control", "DT")) %>%
+  .$condition %>% table()
+
+
+```
+
+
+Define responsive tumor lesions. 
+
+```{r}
+
+ic_df.mean.f = mutate(ic_df.mean.f, ic_response = frac_ic_spots > .1)
+ic_response_tumor = dplyr::filter(ic_df.mean.f, frac_ic_spots > .1) %>% .$lesion_id
+
+```
+
+
+For some reason this has to be run twice. I think it may be because of the assignment thing not getting registered within the scope until after. 
+
+```{r}
+# define and plot the responsive vs non-responsive tumors and see if it lines up
+## responsive tumors will be defined by + or -
+
+for(x in names(d_cc)){
+  d_cc[[x]]@meta.data$lesion_id <- paste(d_cc[[x]]@meta.data$section, d_cc[[x]]@meta.data$tumor_lesion, sep = ":")
+  d_cc[[x]]@meta.data$ic_response <- left_join(d_cc[[x]]@meta.data, dplyr::select(ic_df.mean.f, lesion_id, ic_response),
+                                                  by = 'lesion_id') %>% .$ic_response
+
+}
+
+
+
+```
+
+
+## pos or neg response plot
+
+Plotting each section and whether the defined lesion was defined as having the inflammatory cytokine (IC) response or not. 
+
+```{r}
+invisible(lapply(names(d_cc), function(x){
+  # set the cluster ID to have section identifiers as well
+  Idents(d_cc[[x]]) <<- 'ic_response'
+}))
+
+sp = lapply(d_cc[c('DT1_A1', 'DT2_C1')], function(x){
+  SpatialDimPlot(x, pt.size.factor = 1.6, image.alpha = 0) + scale_fill_manual(values = c('royalblue', 'firebrick'), na.value = 'white')
+})
+#pdf(file.path(fig_dir, 'tumorResponse_spatPlot.pdf'))
+sp
+#dev.off()
+```
+
+## write out metadata for tumors
+
+```{r, eval = F, include = F}
+
+meta.l = lapply(names(d_cc), function(x){
+  d_cc[[x]]@meta.data[,c('tumor_type', 'tumor_type_mod', 'tumor_lesion', 'ifn_shared', 'ic_shared', 'lesion_id', 'ic_response')] %>%
+    mutate(barcode = rownames(d_cc[[x]]@meta.data)) %>%
+    left_join(niche_labels, by = 'barcode') %>%
+    dplyr::select(barcode, everything())
+})
+names(meta.l) = names(d_cc)
+
+lapply(names(meta.l), function(x){
+  write.csv(meta.l[[x]], file = file.path(deconv_base_folder, 'deconv_viter1merged', paste0(x, "_meta.csv")), 
+            quote = F, row.names = F)
+})
+
+```
+
+### barplot of tumor state and IC response
+
+```{r}
+# set the condition
+#ic_df.mean.f = mutate(ic_df.mean.f, condition = ifelse(grepl("Ctrl", lesion_id), "Control", "Treg depletion"))
+ic_df.mean.tt = ic_df %>%  mutate( condition = ifelse(grepl("Ctrl", section), "Control", "Treg depletion")) %>%
+  dplyr::filter(lesion_size > 6) %>%
+  dplyr::select(condition, lesion_id, tumor_type) %>%
+  distinct() %>%
+  group_by(tumor_type, condition) %>%
+  summarise(num_lesion_areas = n()) %>%
+  ungroup()
+
+ic_df.mean.ttic = ic_df %>%  mutate( condition = ifelse(grepl("Ctrl", section), "Control", "Treg depletion")) %>%
+  dplyr::filter(lesion_size > 6 & condition == "Treg depletion") %>%
+  dplyr::select(condition, lesion_id, tumor_type) %>%
+  distinct() %>%
+  dplyr::mutate(IFN_IC_response = lesion_id %in% ic_response_tumor) %>%
+  group_by(tumor_type, IFN_IC_response) %>%
+  summarise(num_lesion_areas = n()) %>%
+  ungroup()
+
+```
+
+Barplot of lesion type by condition. 
+
+```{r, width = 5, height = 3}
+
+# pdf(file.path(fig_dir, 'tumor_lesion_by_condition_bar.pdf'),
+#     height = 4, width = 12)
+ggplot(ic_df.mean.tt, aes(x = tumor_type, y = num_lesion_areas)) +
+  geom_bar(stat = 'identity', aes(fill = condition), color = 'black', 
+           position = 'dodge', width = .5) +
+  theme_classic() + 
+  labs(x = 'Tumor lesion state', y = 'Number of lesion areas') + 
+  scale_fill_manual(values = c('grey', 'firebrick')) + 
+  theme(
+    axis.text = element_text(size = 12), 
+    axis.title = element_text(size = 14))
+#dev.off()
+
+
+```
+
+Barplot of lesion type by response status. 
+
+
+```{r}
+
+# pdf(file.path(fig_dir, 'tumor_lesion_by_response_bar.pdf'),
+#     height = 4, width = 12)
+ggplot(ic_df.mean.ttic, aes(x = tumor_type, y = num_lesion_areas)) +
+  geom_bar(stat = 'identity', aes(fill = IFN_IC_response), color = 'black', 
+           position = 'dodge', width = .5) +
+  theme_classic() + 
+  labs(x = 'Tumor lesion state', y = 'Number of lesion areas') + 
+  scale_fill_manual(values = c('grey', 'firebrick'), 
+                    name = 'Immune response') + 
+      theme(
+        axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14))
+#dev.off()
+
+```
+
+Barplot of selected tumor states to highlight high plasticity and gastric responses. 
+
+```{r}
+
+
+# pdf(file.path(fig_dir, 'tumor_lesion_by_response_bar_hpgas.pdf'),
+#     height = 4, width = 6)
+ggplot(ic_df.mean.tt %>% dplyr::filter(tumor_type %in% c('Gastric', 'High.plasticity')), aes(x = tumor_type, y = num_lesion_areas)) +
+  geom_bar(stat = 'identity', aes(fill = condition), color = 'black', 
+           position = 'dodge', width = .5) +
+  theme_classic() + 
+  labs(x = 'Tumor lesion state', y = 'Number of lesion areas') + 
+  scale_fill_manual(values = c('grey', 'firebrick')) + 
+  theme(
+    axis.text = element_text(size = 12), 
+    axis.title = element_text(size = 14))
+
+ggplot(ic_df.mean.ttic %>% dplyr::filter(tumor_type %in% c('Gastric', 'High.plasticity')), aes(x = tumor_type, y = num_lesion_areas)) +
+  geom_bar(stat = 'identity', aes(fill = IFN_IC_response), color = 'black', 
+           position = 'dodge', width = .5) +
+  theme_classic() + 
+  labs(x = 'Tumor lesion state', y = 'Number of lesion areas') + 
+  scale_fill_manual(values = c('grey', 'firebrick'), 
+                    name = 'Immune response') + 
+      theme(
+        axis.text = element_text(size = 12), 
+        axis.title = element_text(size = 14))
+#dev.off()
+```
+
+### heatmap of tumor state
+
+```{r}
+
+
+rownames(ct_epi.scale) = rownames(ct_epi)
+ic_df.tl = ic_df %>% 
+  dplyr::filter(lesion_size > 6)
+
+# average spots in each tumor lesion that we want
+ct_epi.scale.tl = apply(ct_epi.scale[ic_df.tl$barcode,], 2, function(x){
+  tapply(x, factor(ic_df.tl$lesion_id), mean)
+})
+
+ct_epi.scale.meta = left_join(data.frame(lesion_id = rownames(ct_epi.scale.tl)), 
+                              ic_df.tl %>% dplyr::select(section, tumor_type_mod, lesion_id, lesion_size) %>%
+                                distinct(), 
+                              by = 'lesion_id') %>%
+  left_join(dplyr::select(ic_df.mean.f, lesion_id, ic_response) %>% distinct(), 
+            by = 'lesion_id') %>%
+  mutate(condition = ifelse(grepl("Ctrl", section), 'Control', 'Treg depletion'))
+
+```
+
+
+
+```{r, fig.height = 6, fig.width=8}
+
+# color the columns by response
+response_id = ct_epi.scale.meta$ic_response %>% as.factor() %>% as.numeric()
+response_id[is.na(response_id)] = 3
+col_vec = c('dodgerblue', 'firebrick', 'grey')
+col_vec_resp = col_vec[response_id]
+names(col_vec_resp) = response_id
+
+
+ra <- rowAnnotation(`IC response` = names(col_vec_resp),
+                    `size` = log10(ct_epi.scale.meta$lesion_size),
+                       col = list(`IC response` = col_vec_resp))
+
+Heatmap(ct_epi.scale.tl, clustering_method_rows = 'average', clustering_distance_rows = 'pearson', 
+        clustering_distance_columns = 'pearson', clustering_method_columns = 'average', 
+        split = ct_epi.scale.meta$condition, 
+        right_annotation = ra, 
+        show_row_names = F)
+
+```
+
+
+## differential expression responding tumors
+
+```{r}
+d.m_rep1.tum = AddMetaData(d.m_rep1.tum, ic_df[match(colnames(d.m_rep1.tum), ic_df$barcode),'lesion_id'], col.name = 'lesion_id')
+d.m_rep1.tum@meta.data$ic_response = ic_df.mean.f[match(d.m_rep1.tum@meta.data$lesion_id, ic_df.mean.f$lesion_id),'ic_response'] %>% .$ic_response
+d.m_rep1.tum.dt = subset(d.m_rep1.tum, treatment == 'DT' & ic_response %in% c(FALSE, TRUE))
+
+```
+
+```{r}
+
+Idents(d.m_rep1.tum.dt) <- 'ic_response'
+de_ic = FindMarkers(d.m_rep1.tum.dt, ident.1 = 'TRUE', ident.2 = 'FALSE', assay = 'SCT', slot = 'data', test.use = 'wilcox')
+de_ic = tibble::rownames_to_column(de_ic, var = 'gene')
+de_ic = mutate(de_ic, significant = abs(avg_log2FC) > .5 & p_val_adj < .01,
+               highlight = abs(avg_log2FC) > .75 & p_val_adj < 1e-30)
+```
+
+How many significant genes?
+
+```{r}
+
+dplyr::filter(de_ic, significant == TRUE) %>% .$avg_log2FC %>% sign() %>% table()
+
+```
+
+Volcano plot of differentially expressed genes. Selected for genes that are the most differentially expressed (log FC > .75). 
+
+```{r, fig.height=5, fig.width=5}
+
+# pdf(file.path(fig_dir, 'volcano_de_wilcox_ic_response.pdf'), 
+#     height = 6, width = 8)
+ggplot(de_ic, aes(x = avg_log2FC, y = -log10(p_val_adj))) +
+  geom_point(aes(color = significant)) +
+  theme_classic() +
+  scale_color_manual(values = c('grey', 'firebrick')) +
+  ggrepel::geom_text_repel(data = dplyr::filter(de_ic, highlight == TRUE), 
+                           aes(label = gene)) +
+  theme(
+    axis.text = element_text(size = 12), 
+    axis.title = element_text(size = 14)) +
+  labs(x = 'log2 Fold-Change', y = '-log10 adjusted p')
+#dev.off()
+
+```
+
+
+### write out DE results
+
+```{r, eval = F, include = F}
+
+write.csv(de_ic, file = file.path(fig_dir, 'ic_de_wilcox_20221128.csv'), quote = F, row.names = F)
+
+
+```
+
+
+### plot of Sox9 and Pf4
+
+```{r}
+d.sct.dt1 = subset(d.m_rep1, section == 'DT1_A1')
+d.sct.dt1@images = list(slice1 = d.sct.dt1@images$slice1.4)
+
+d.sct.dt2 = subset(d.m_rep1, section == 'DT2_C1')
+d.sct.dt2@images = list(slice1 = d.sct.dt2@images$slice1.6)
+```
+
+```{r}
+
+#pdf(file.path(fig_dir, 'sox9_pf4_tumorExp_spatPlot.pdf'))
+
+SpatialFeaturePlot(d.sct.dt1, c('Sox9') ) +
+  scale_fill_viridis_c(option = 'B')
+
+SpatialFeaturePlot(d.sct.dt1, c('Pf4') ) +
+  scale_fill_viridis_c(option = 'B')
+
+SpatialFeaturePlot(d.sct.dt1, c('Id2') ) +
+  scale_fill_viridis_c(option = 'B')
+
+SpatialFeaturePlot(d.sct.dt2, c('Sox9') ) +
+  scale_fill_viridis_c(option = 'B')
+
+SpatialFeaturePlot(d.sct.dt2, c('Pf4') ) +
+  scale_fill_viridis_c(option = 'B')
+
+SpatialFeaturePlot(d.sct.dt2, c('Id2') ) +
+  scale_fill_viridis_c(option = 'B')
+
+
+
+#dev.off()
+
+
+```
+
+
+```{r}
+
+# try with just standardly normalized data so that I can 
+d.dt = d[c('DT1_A1', 'DT2_C1')]
+for(i in names(d.dt)){
+  d.dt[[i]] = NormalizeData(d.dt[[i]])
+}
+
+```
+
+
+```{r}
+
+SpatialFeaturePlot(d.dt$DT1_A1, c('Sox9') ) +
+  scale_fill_viridis_c(option = 'B')
+
+SpatialFeaturePlot(d.dt$DT1_A1, c('Pf4') ) +
+  scale_fill_viridis_c(option = 'B')
+
+
+
+SpatialFeaturePlot(d.dt$DT2_C1, c('Sox9') ) +
+  scale_fill_viridis_c(option = 'B')
+
+SpatialFeaturePlot(d.dt$DT2_C1, c('Pf4') ) +
+  scale_fill_viridis_c(option = 'B')
+
+
+
+
+```
