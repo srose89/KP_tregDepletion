@@ -9,4 +9,6 @@ repo accompanying Glasner, Rose, Sharma, et al manuscript
 	- Assess factor use in tissue - factor_usage_visium.Rmd (html)
 	- Define signaling niches - IFN_IC_niche_definition.Rmd
 	- Tumor state analysis - tumorState_analysis.Rmd (html)
+	- QC of deconvolution - deconv_indiv_qc.Rmd (html)![image](https://user-images.githubusercontent.com/4626152/206811233-5abf1770-40f4-4aa2-bfc0-6a81f3fe1e08.png)
+
 Functions used through the course of visium analysis - Visium_helper_functions.R![image](https://user-images.githubusercontent.com/4626152/206810345-f8267187-74b1-4bdd-bd28-fbc004735366.png)
